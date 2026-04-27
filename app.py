@@ -1,263 +1,229 @@
+# =========================
+# FILE: app.py
+# =========================
 import streamlit as st
-import sqlite3
+from datetime import datetime, date
 import pandas as pd
-from datetime import date
+from supabase import create_client
 
-# =========================
+# -------------------------
 # CONFIG
-# =========================
-st.set_page_config(page_title="Barcode ERP", layout="wide")
+# -------------------------
+SUPABASE_URL = "YOUR_SUPABASE_URL"
+SUPABASE_KEY = "YOUR_SUPABASE_KEY"
 
-# =========================
-# UI CLEAN (REMOVE HEADER)
-# =========================
-st.markdown("""
-<style>
-header {visibility:hidden;}
-[data-testid="stToolbar"] {display:none;}
-footer {visibility:hidden;}
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-.main {background-color:#f0f2f5;}
+st.set_page_config(page_title="Barcode Scanner", layout="wide")
 
-section[data-testid="stSidebar"] {
-    background-color:#0a1f44;
-}
-section[data-testid="stSidebar"] * {
-    color:white !important;
-}
-
-.custom-footer {
-    position: fixed;
-    bottom: 10px;
-    right: 20px;
-    font-size: 12px;
-    color: #666;
-}
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown(
-    '<div class="custom-footer">Created by <b>Sweetson Joseph</b></div>',
-    unsafe_allow_html=True
-)
-
-# =========================
-# DATABASE (SQLite)
-# =========================
-conn = sqlite3.connect("data.db", check_same_thread=False)
-c = conn.cursor()
-
-c.execute("""
-CREATE TABLE IF NOT EXISTS documents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    document_no TEXT,
-    invoice_no TEXT,
-    actual_lines INTEGER,
-    expiry_required BOOLEAN,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-
-c.execute("""
-CREATE TABLE IF NOT EXISTS line_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    document_id INTEGER,
-    serial_no INTEGER,
-    item_no TEXT,
-    barcode TEXT,
-    description TEXT,
-    remark TEXT,
-    mfg_date TEXT,
-    expiry_date TEXT,
-    shelf_life REAL
-)
-""")
-
-conn.commit()
-
-# =========================
+# -------------------------
 # SESSION STATE
-# =========================
+# -------------------------
 if "doc_id" not in st.session_state:
     st.session_state.doc_id = None
-    st.session_state.count = 0
-    st.session_state.actual = 0
-    st.session_state.inward = None
+if "serial" not in st.session_state:
+    st.session_state.serial = 1
 
-# =========================
-# FUNCTIONS
-# =========================
+# -------------------------
+# UTIL FUNCTIONS
+# -------------------------
 def generate_doc_no():
-    c.execute("SELECT document_no FROM documents ORDER BY id DESC LIMIT 1")
-    row = c.fetchone()
-    if row:
-        num = int(row[0].split("/")[-1]) + 1
+    res = supabase.table("documents").select("document_no").order("created_at", desc=True).limit(1).execute()
+    if res.data:
+        last = int(res.data[0]['document_no'].split('/')[-1])
     else:
-        num = 1
-    return f"CDRSL/BARCODE/{str(num).zfill(3)}"
+        last = 0
+    return f"CDRSL/BARCODE/{str(last+1).zfill(3)}"
 
 
-def shelf_life(mfg, exp, inward):
-    if not mfg or not exp or not inward:
+def calc_shelf_life(mfg, exp):
+    if not mfg or not exp:
         return None
     total = (exp - mfg).days
-    remaining = (exp - inward).days
-    return round((remaining / total) * 100, 2) if total > 0 else 0
+    remaining = (exp - date.today()).days
+    if total <= 0:
+        return 0
+    return round((remaining / total) * 100, 2)
 
 
-# =========================
-# SIDEBAR
-# =========================
-st.sidebar.title("📦 ERP Menu")
+def check_barcode(barcode):
+    res = supabase.table("barcode_master").select("*").eq("barcode", barcode).execute()
+    return res.data
 
-menu = st.sidebar.radio("", [
-    "Dashboard",
-    "Header Entry",
-    "Scanning",
-    "Report"
-])
+# -------------------------
+# LOGIN (Simple Placeholder)
+# -------------------------
+st.sidebar.title("User")
+user_email = st.sidebar.text_input("Email")
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Created by Sweetson Joseph**")
+# -------------------------
+# MASTER UPLOAD
+# -------------------------
+st.sidebar.subheader("Upload Barcode Master")
+file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 
-# =========================
-# DASHBOARD
-# =========================
-if menu == "Dashboard":
+if file:
+    df = pd.read_csv(file)
+    supabase.table("barcode_master").insert(df.to_dict(orient="records")).execute()
+    st.sidebar.success("Uploaded!")
 
-    st.title("📊 Dashboard")
+# -------------------------
+# HEADER
+# -------------------------
+st.title("📦 Barcode & Expiry Scanner")
 
-    c.execute("SELECT COUNT(*) FROM documents")
-    total_docs = c.fetchone()[0]
+st.subheader("Header Entry")
 
-    col1, col2 = st.columns(2)
-    col1.metric("Documents", total_docs)
-    col2.metric("Scanned Items", st.session_state.count)
+invoice = st.text_input("Invoice No")
+bill_no = st.text_input("Bill of Entry No")
+bill_date = st.date_input("Bill Entry Date")
+inward_date = st.date_input("Inward Date")
+warehouse_date = st.date_input("Warehouse Date")
+file_no = st.text_input("File No")
+container = st.text_input("Container No")
+expected_lines = st.number_input("Expected Lines", min_value=1)
+actual_lines = st.number_input("Actual Lines", min_value=1)
+expiry_required = st.checkbox("Expiry Required")
+expiry_threshold = st.number_input("Expiry Threshold %", value=20)
 
-# =========================
-# HEADER ENTRY
-# =========================
-elif menu == "Header Entry":
-
-    st.title("📄 Header Entry")
-
+if st.button("Create Document"):
     doc_no = generate_doc_no()
-    st.success(f"Document No: {doc_no}")
 
-    col1, col2, col3 = st.columns(3)
+    res = supabase.table("documents").insert({
+        "document_no": doc_no,
+        "created_at": str(datetime.now()),
+        "invoice_no": invoice,
+        "bill_entry_no": bill_no,
+        "bill_entry_date": str(bill_date),
+        "inward_date": str(inward_date),
+        "warehouse_date": str(warehouse_date),
+        "file_no": file_no,
+        "container_no": container,
+        "expected_lines": expected_lines,
+        "actual_lines": actual_lines,
+        "expiry_required": expiry_required,
+        "expiry_threshold": expiry_threshold,
+        "created_by": user_email
+    }).execute()
 
-    with col1:
-        invoice = st.text_input("Invoice No")
+    st.session_state.doc_id = res.data[0]['id']
+    st.success(f"Document Created: {doc_no}")
 
-    with col2:
-        inward = st.date_input("Inward Date")
-
-    with col3:
-        actual = st.number_input("Actual Lines", min_value=1)
-
-    expiry = st.selectbox("Expiry Required", ["Yes", "No"])
-
-    if st.button("💾 Save Header"):
-
-        c.execute("""
-        INSERT INTO documents (document_no, invoice_no, actual_lines, expiry_required)
-        VALUES (?, ?, ?, ?)
-        """, (doc_no, invoice, actual, expiry == "Yes"))
-
-        conn.commit()
-
-        st.session_state.doc_id = c.lastrowid
-        st.session_state.actual = actual
-        st.session_state.count = 0
-        st.session_state.inward = inward
-
-        st.success("✅ Header Saved")
-
-# =========================
+# -------------------------
 # SCANNING
-# =========================
-elif menu == "Scanning":
+# -------------------------
+if st.session_state.doc_id:
+    st.subheader("Scan Items")
 
-    st.title("📡 Scanning")
-
-    if not st.session_state.doc_id:
-        st.warning("⚠ Create header first")
+    if st.session_state.serial > actual_lines:
+        st.success("All items scanned")
         st.stop()
-
-    progress = st.session_state.count / st.session_state.actual
-    st.progress(progress)
 
     barcode = st.text_input("Scan Barcode")
 
-    item_no = st.text_input("Item No")
-    desc = st.text_input("Description")
+    if barcode:
+        result = check_barcode(barcode)
 
-    mfg = st.date_input("Manufacturing Date")
-    exp = st.date_input("Expiry Date")
+        if result:
+            remark = "Already Barcode Exists"
+            item_no = result[0]['item_no']
+            desc = result[0]['description']
+        else:
+            remark = "New Item"
+            item_no = st.text_input("Item No")
+            desc = st.text_input("Description")
 
-    if st.button("➕ Add Item"):
+        st.write("Remark:", remark)
 
-        shelf = shelf_life(mfg, exp, st.session_state.inward)
+        mfg = None
+        exp = None
+        shelf = None
 
-        c.execute("""
-        INSERT INTO line_items
-        (document_id, serial_no, item_no, barcode, description, remark, mfg_date, expiry_date, shelf_life)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            st.session_state.doc_id,
-            st.session_state.count + 1,
-            item_no,
-            barcode,
-            desc,
-            "OK",
-            str(mfg),
-            str(exp),
-            shelf
-        ))
+        if expiry_required:
+            mfg = st.date_input("MFG Date")
+            exp = st.date_input("Expiry Date")
+            shelf = calc_shelf_life(mfg, exp)
+            st.write("Shelf Life %:", shelf)
 
-        conn.commit()
+        if st.button("Save Line"):
+            supabase.table("line_items").insert({
+                "document_id": st.session_state.doc_id,
+                "serial_no": st.session_state.serial,
+                "item_no": item_no,
+                "barcode": barcode,
+                "description": desc,
+                "mfg_date": str(mfg) if mfg else None,
+                "expiry_date": str(exp) if exp else None,
+                "shelf_life": shelf,
+                "remark": remark,
+                "verified_by": user_email
+            }).execute()
 
-        st.session_state.count += 1
+            st.session_state.serial += 1
+            st.success("Saved")
+            st.rerun()
 
-        st.success(f"Added | Shelf Life: {shelf}%")
+    if st.button("Cancel Scanning"):
+        st.session_state.doc_id = None
+        st.session_state.serial = 1
+        st.warning("Scanning Cancelled")
 
-    if st.session_state.count >= st.session_state.actual:
-        st.success("🎉 All items scanned")
-
-    if st.button("🛑 Cancel"):
-        st.error("Cancelled")
-        st.stop()
-
-# =========================
+# -------------------------
 # REPORT
+# -------------------------
+st.subheader("Reports")
+
+if st.button("Load Report"):
+    data = supabase.table("line_items").select("*").execute().data
+    df = pd.DataFrame(data)
+    st.dataframe(df)
+
 # =========================
-elif menu == "Report":
+# FILE: requirements.txt
+# =========================
+# streamlit
+# supabase
+# pandas
+# python-dotenv
 
-    st.title("📊 Report")
+# =========================
+# SQL (RUN IN SUPABASE)
+# =========================
+# create table barcode_master (
+# id uuid default gen_random_uuid() primary key,
+# item_no text,
+# barcode text,
+# description text
+# );
 
-    doc_id = st.number_input("Enter Document ID", min_value=1)
+# create table documents (
+# id uuid default gen_random_uuid() primary key,
+# document_no text,
+# created_at timestamp,
+# invoice_no text,
+# bill_entry_no text,
+# bill_entry_date date,
+# inward_date date,
+# warehouse_date date,
+# file_no text,
+# container_no text,
+# expected_lines int,
+# actual_lines int,
+# expiry_required boolean,
+# expiry_threshold float,
+# created_by text
+# );
 
-    if st.button("Fetch"):
-
-        c.execute("SELECT * FROM documents WHERE id=?", (doc_id,))
-        header = c.fetchall()
-
-        c.execute("SELECT * FROM line_items WHERE document_id=?", (doc_id,))
-        lines = c.fetchall()
-
-        st.subheader("Header")
-        st.write(header)
-
-        df = pd.DataFrame(lines, columns=[
-            "ID","DocID","Serial","Item No","Barcode",
-            "Desc","Remark","MFG","EXP","Shelf"
-        ])
-
-        st.subheader("Line Items")
-        st.dataframe(df, use_container_width=True)
-
-        st.download_button(
-            "⬇ Download CSV",
-            df.to_csv(index=False),
-            "report.csv"
-        )
+# create table line_items (
+# id uuid default gen_random_uuid() primary key,
+# document_id uuid,
+# serial_no int,
+# item_no text,
+# barcode text,
+# description text,
+# mfg_date date,
+# expiry_date date,
+# shelf_life float,
+# remark text,
+# verified_by text
+# );
